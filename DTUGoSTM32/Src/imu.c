@@ -8,6 +8,18 @@
 #define LSM303_OUT_X_L_A        0x28
 #define LSM303_ACC_SENSITIVITY  0.001f // 1 mg/LSB (Thang ±2g, 12-bit)
 #define ALPHA 0.98f // Hệ số lọc bù (98% Gyro, 2% Accel)
+
+#define GYRO_DEADBAND_DPS   0.15f    // dưới mức này coi yaw rate = 0
+#define BIAS_TRACK_THRESH   0.5f     // dps, dưới mức này coi như đứng yên
+#define BIAS_TRACK_ALPHA    0.002f   // ~10 giây ở 50 Hz
+#define DT_DEFAULT          0.02f
+#define DT_MAX              0.1f
+
+/* Trạng thái bộ lọc (đưa ra file scope để dùng chung) */
+static float filtered_roll  = 0.0f;
+static float filtered_pitch = 0.0f;
+static uint8_t is_first_run = 1;
+
 static L3GD20_HandleTypeDef hgyro;
 static float current_yaw = 0.0f;
 static uint32_t last_time = 0;
@@ -15,6 +27,12 @@ static uint32_t last_time = 0;
 static float gyro_bias_x = 0.0f;
 static float gyro_bias_y = 0.0f;
 static float gyro_bias_z = 0.0f;
+
+/* Đặt lại hướng hiện tại làm 0 */
+void IMU_ResetYaw(void) {
+    current_yaw = 0.0f;
+}
+
 HAL_StatusTypeDef IMU_Init(SPI_HandleTypeDef *hspi, I2C_HandleTypeDef *hi2c, UART_HandleTypeDef *huart) {
     char msg[80];
 
@@ -29,7 +47,7 @@ HAL_StatusTypeDef IMU_Init(SPI_HandleTypeDef *hspi, I2C_HandleTypeDef *hi2c, UAR
         return HAL_ERROR;
     }
 
-    // 3. THỰC HIỆN CALIB GYRO BIAS (Lấy 200 mẫu khi đứng yên trong 1 giây)
+    // 3. THỰC HIỆN CALIB GYRO BIAS (Lấy 500 mẫu khi đứng yên trong 2.5 giây)
     if (huart) {
         int n = snprintf(msg, sizeof(msg), "[IMU] Calibrating Gyro Offset... Keep board STILL!\r\n");
         HAL_UART_Transmit(huart, (uint8_t*)msg, (uint16_t)n, 100);
@@ -37,20 +55,23 @@ HAL_StatusTypeDef IMU_Init(SPI_HandleTypeDef *hspi, I2C_HandleTypeDef *hi2c, UAR
 
     float sum_x = 0.0f, sum_y = 0.0f, sum_z = 0.0f;
     L3GD20_Data_t gyro_raw;
-    const int calib_samples = 200;
-
+    const int calib_samples = 500; // Lấy 500 mẫu trong 2.5 giây
+    int valid = 0;
     for (int i = 0; i < calib_samples; i++) {
         if (L3GD20_ReadDPS(&hgyro, &gyro_raw) == HAL_OK) {
             sum_x += gyro_raw.X;
             sum_y += gyro_raw.Y;
             sum_z += gyro_raw.Z;
+            valid++;
         }
         HAL_Delay(5); // Lấy mẫu mỗi 5ms
     }
 
-    gyro_bias_x = sum_x / (float)calib_samples;
-    gyro_bias_y = sum_y / (float)calib_samples;
-    gyro_bias_z = sum_z / (float)calib_samples;
+    if (valid < calib_samples / 2) return HAL_ERROR;   // đọc lỗi quá nhiều
+
+    gyro_bias_x = sum_x / (float)valid;
+    gyro_bias_y = sum_y / (float)valid;
+    gyro_bias_z = sum_z / (float)valid;
 
     if (huart) {
         int n = snprintf(msg, sizeof(msg), "[IMU OK] Calib Done! GyroZ Offset = %.3f dps\r\n", gyro_bias_z);
@@ -95,34 +116,58 @@ HAL_StatusTypeDef IMU_ReadOrientation(I2C_HandleTypeDef *hi2c, IMU_OrientationTy
     IMU_Vector3f_t gyro;
 
     if (IMU_ReadAccel(hi2c, &acc) != HAL_OK) return HAL_ERROR;
-    if (IMU_ReadGyro(&gyro) != HAL_OK) return HAL_ERROR;
+    if (IMU_ReadGyro(&gyro) != HAL_OK) return HAL_ERROR;   // gyro đã trừ bias
 
+    /* ---- dt ---- */
     uint32_t now = HAL_GetTick();
-    float dt = (now - last_time) / 1000.0f;
-    if (last_time == 0 || dt <= 0.0f) dt = 0.02f;
+    float dt;
+    if (last_time == 0) {
+        dt = DT_DEFAULT;
+    } else {
+        dt = (now - last_time) / 1000.0f;
+        if (dt <= 0.0f) {
+            // Gọi 2 lần trong cùng 1 ms: không tích phân, trả lại giá trị cũ
+            orientation->roll  = filtered_roll;
+            orientation->pitch = filtered_pitch;
+            orientation->yaw   = current_yaw;
+            return HAL_OK;
+        }
+        if (dt > DT_MAX) dt = DT_MAX;   // tránh nhảy góc sau khi bị treo/lỗi I2C
+    }
     last_time = now;
 
-    // 1. Tính góc Roll & Pitch từ Gia tốc
+    /* ---- Tự cập nhật bias khi robot đứng yên ---- */
+    float acc_norm = sqrtf(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z);
+    uint8_t still = (fabsf(gyro.x) < BIAS_TRACK_THRESH) &&
+                    (fabsf(gyro.y) < BIAS_TRACK_THRESH) &&
+                    (fabsf(gyro.z) < BIAS_TRACK_THRESH) &&
+                    (acc_norm > 0.95f) && (acc_norm < 1.05f);
+
+    if (still) {
+        // gyro lúc này = (raw - bias) = phần bias còn sót
+        gyro_bias_x += BIAS_TRACK_ALPHA * gyro.x;
+        gyro_bias_y += BIAS_TRACK_ALPHA * gyro.y;
+        gyro_bias_z += BIAS_TRACK_ALPHA * gyro.z;
+    }
+
+    /* Deadband riêng cho trục Z (yaw) */
+    if (fabsf(gyro.z) < GYRO_DEADBAND_DPS) gyro.z = 0.0f;
+
+    /* ---- 1. Roll & Pitch từ gia tốc ---- */
     float accel_roll  = atan2f(acc.y, acc.z) * 180.0f / (float)M_PI;
     float accel_pitch = atan2f(-acc.x, sqrtf(acc.y * acc.y + acc.z * acc.z)) * 180.0f / (float)M_PI;
 
-    // 2. Khởi tạo biến lọc bù
-    static float filtered_roll = 0.0f;
-    static float filtered_pitch = 0.0f;
-    static uint8_t is_first_run = 1;
-
-    // Lần đọc đầu tiên: gán trực tiếp góc từ gia tốc để không bị trôi/hội tụ chậm
+    /* ---- 2. Bộ lọc bù ---- */
     if (is_first_run) {
         filtered_roll  = accel_roll;
         filtered_pitch = accel_pitch;
         is_first_run = 0;
     } else {
-        // Các lần tiếp theo: chạy bộ lọc bù bình thường
-        filtered_roll  = ALPHA * (filtered_roll + gyro.x * dt) + (1.0f - ALPHA) * accel_roll;
+        filtered_roll  = ALPHA * (filtered_roll  + gyro.x * dt) + (1.0f - ALPHA) * accel_roll;
         filtered_pitch = ALPHA * (filtered_pitch + gyro.y * dt) + (1.0f - ALPHA) * accel_pitch;
     }
 
-    // 3. Tích phân góc Yaw (đã trừ Bias)
+    /* ---- 3. Tích phân yaw ---- */
     current_yaw += gyro.z * dt;
     if (current_yaw > 180.0f)  current_yaw -= 360.0f;
     if (current_yaw < -180.0f) current_yaw += 360.0f;
