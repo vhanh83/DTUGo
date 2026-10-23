@@ -115,6 +115,14 @@ def generate_launch_description():
             name='foxglove_bridge',
             parameters=[{'port': 8765, 'address': '0.0.0.0'}],
         )
+    # WebSocket Bridge Node
+    webclient_bridge_node = Node(
+        package='orion_base',
+        executable='webclient_bridge',
+        name='webclient_bridge',
+        output='screen',
+        parameters=[params_file],
+    )
 
     return LaunchDescription([
         #stm32_bridge_node,
@@ -124,5 +132,6 @@ def generate_launch_description():
         joystick_parser_node,
         #roboeyes_node,
         cmd_mux_node,
-        foxglove_bridge_node
+        #foxglove_bridge_node,
+        webclient_bridge_node
     ])
